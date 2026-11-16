@@ -1,0 +1,442 @@
+name: Build Luma APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Gerar projeto Android
+        run: |
+          cat > settings.gradle.kts <<'LUMA_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Luma"
+          include(":app")
+          LUMA_EOF
+          cat > build.gradle.kts <<'LUMA_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          LUMA_EOF
+          cat > gradle.properties <<'LUMA_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          LUMA_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'LUMA_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.luma.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.luma.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          LUMA_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'LUMA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <queries>
+                  <intent><action android:name="android.speech.RecognitionService" /></intent>
+              </queries>
+              <application
+                  android:label="Luma"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".WakeService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          LUMA_EOF
+          mkdir -p app/src/main/java/com/luma/app
+          cat > app/src/main/java/com/luma/app/ChatStore.kt <<'LUMA_EOF'
+          package com.luma.app
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          data class Msg(val role: String, val text: String)
+
+          object ChatStore {
+              private fun p(c: Context) = c.getSharedPreferences("luma", Context.MODE_PRIVATE)
+
+              @Synchronized
+              fun all(c: Context): List<Msg> {
+                  val arr = JSONArray(p(c).getString("msgs", "[]"))
+                  return (0 until arr.length()).map {
+                      val o = arr.getJSONObject(it)
+                      Msg(o.getString("role"), o.getString("text"))
+                  }
+              }
+
+              @Synchronized
+              fun add(c: Context, role: String, text: String) {
+                  val arr = JSONArray(p(c).getString("msgs", "[]"))
+                  arr.put(JSONObject().put("role", role).put("text", text))
+                  p(c).edit().putString("msgs", arr.toString()).apply()
+              }
+
+              fun clear(c: Context) = p(c).edit().remove("msgs").apply()
+              fun key(c: Context): String = p(c).getString("key", "") ?: ""
+              fun setKey(c: Context, k: String) = p(c).edit().putString("key", k.trim()).apply()
+          }
+          LUMA_EOF
+          mkdir -p app/src/main/java/com/luma/app
+          cat > app/src/main/java/com/luma/app/AiClient.kt <<'LUMA_EOF'
+          package com.luma.app
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object AiClient {
+              private const val SYSTEM = "Voce e a Luma, uma assistente de voz amigavel. " +
+                  "Responda sempre em portugues do Brasil, de forma curta (ate 3 frases), natural e sem markdown."
+
+              fun ask(c: Context, question: String): String {
+                  val key = ChatStore.key(c)
+                  if (key.isEmpty()) return "Cole sua chave da API no app primeiro."
+                  return try {
+                      val hist = ChatStore.all(c).takeLast(10).toMutableList()
+                      while (hist.isNotEmpty() && hist.first().role != "user") hist.removeAt(0)
+                      val msgs = JSONArray()
+                      var last = ""
+                      for (m in hist) {
+                          if (m.role == last) continue
+                          msgs.put(JSONObject().put("role", m.role).put("content", m.text))
+                          last = m.role
+                      }
+                      if (last == "user") msgs.remove(msgs.length() - 1)
+                      msgs.put(JSONObject().put("role", "user").put("content", question))
+                      val body = JSONObject()
+                          .put("model", "claude-haiku-5-5")
+                          .put("max_tokens", 400)
+                          .put("system", SYSTEM)
+                          .put("messages", msgs)
+                      val con = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                      con.requestMethod = "POST"
+                      con.connectTimeout = 15000
+                      con.readTimeout = 45000
+                      con.setRequestProperty("content-type", "application/json")
+                      con.setRequestProperty("x-api-key", key)
+                      con.setRequestProperty("anthropic-version", "2023-06-01")
+                      con.doOutput = true
+                      con.outputStream.use { it.write(body.toString().toByteArray()) }
+                      val ok = con.responseCode in 200..299
+                      val txt = (if (ok) con.inputStream else con.errorStream).bufferedReader().readText()
+                      if (!ok) return "Erro ${con.responseCode}: " + txt.take(150)
+                      JSONObject(txt).getJSONArray("content").getJSONObject(0).getString("text")
+                  } catch (e: Exception) {
+                      "Sem conexao ou erro: ${e.message}"
+                  }
+              }
+          }
+          LUMA_EOF
+          mkdir -p app/src/main/java/com/luma/app
+          cat > app/src/main/java/com/luma/app/WakeService.kt <<'LUMA_EOF'
+          package com.luma.app
+
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.*
+          import android.speech.*
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import java.text.Normalizer
+          import java.util.Locale
+
+          class WakeService : Service() {
+              private val h = Handler(Looper.getMainLooper())
+              private var sr: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var waiting = false
+              private var busy = false
+              private var running = false
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("luma", "Luma", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "luma")
+                      .setContentTitle("Luma esta escutando")
+                      .setContentText("Diga \"Luma\" e faca sua pergunta")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true).build()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  else startForeground(1, n)
+                  if (!running) {
+                      running = true
+                      tts = TextToSpeech(this) {
+                          ttsReady = it == TextToSpeech.SUCCESS
+                          if (ttsReady) {
+                              tts?.language = Locale("pt", "BR")
+                              tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                                  override fun onStart(u: String?) {}
+                                  override fun onError(u: String?) { h.post { busy = false; listen() } }
+                                  override fun onDone(u: String?) { h.post { busy = false; listen() } }
+                              })
+                          }
+                          h.post { listen() }
+                      }
+                  }
+                  return START_STICKY
+              }
+
+              private fun norm(s: String) =
+                  Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "")
+
+              private fun listen() {
+                  if (!running || busy) return
+                  try {
+                      sr?.destroy()
+                      sr = SpeechRecognizer.createSpeechRecognizer(this)
+                      sr?.setRecognitionListener(listener)
+                      val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                      i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR")
+                      sr?.startListening(i)
+                  } catch (e: Exception) {
+                      h.postDelayed({ listen() }, 2000)
+                  }
+              }
+
+              private val listener = object : RecognitionListener {
+                  override fun onReadyForSpeech(p: Bundle?) {}
+                  override fun onBeginningOfSpeech() {}
+                  override fun onRmsChanged(v: Float) {}
+                  override fun onBufferReceived(b: ByteArray?) {}
+                  override fun onEndOfSpeech() {}
+                  override fun onPartialResults(p: Bundle?) {}
+                  override fun onEvent(t: Int, p: Bundle?) {}
+                  override fun onError(e: Int) {
+                      val d = if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 2000L else 400L
+                      h.postDelayed({ listen() }, d)
+                  }
+                  override fun onResults(r: Bundle?) {
+                      val text = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                      if (text.isNullOrBlank()) { listen(); return }
+                      if (waiting) { waiting = false; ask(text); return }
+                      val n = norm(text)
+                      val idx = n.indexOf("luma")
+                      if (idx < 0) { listen(); return }
+                      val rest = text.substring(minOf(idx + 4, text.length)).trim(' ', ',', '.', '!', '?')
+                      if (rest.length >= 4) ask(rest)
+                      else { waiting = true; say("Pois nao?") }
+                  }
+              }
+
+              private fun say(t: String) {
+                  busy = true
+                  if (!ttsReady) { busy = false; listen(); return }
+                  tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "u" + System.currentTimeMillis())
+              }
+
+              private fun ask(q: String) {
+                  busy = true
+                  ChatStore.add(this, "user", q)
+                  ping()
+                  Thread {
+                      val hist = ChatStore.all(this)
+                      val a = AiClient.ask(this, q)
+                      ChatStore.add(this, "assistant", a)
+                      h.post { ping(); say(a) }
+                  }.start()
+              }
+
+              private fun ping() = sendBroadcast(Intent("luma.UPDATE").setPackage(packageName))
+
+              override fun onDestroy() {
+                  running = false
+                  h.removeCallbacksAndMessages(null)
+                  sr?.destroy(); tts?.shutdown()
+                  super.onDestroy()
+              }
+          }
+          LUMA_EOF
+          mkdir -p app/src/main/java/com/luma/app
+          cat > app/src/main/java/com/luma/app/MainActivity.kt <<'LUMA_EOF'
+          package com.luma.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.*
+          import android.graphics.Color
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var box: LinearLayout
+              private lateinit var scroll: ScrollView
+              private lateinit var toggle: Button
+              private var on = false
+
+              private val rx = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context?, i: Intent?) = refresh()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#101418"))
+                      setPadding(dp(12), dp(36), dp(12), dp(12))
+                  }
+                  val title = TextView(this).apply {
+                      text = "Luma"; textSize = 26f; setTextColor(Color.WHITE)
+                  }
+                  toggle = Button(this).apply {
+                      text = "Ativar escuta (diga \"Luma\")"
+                      setOnClickListener { toggleService() }
+                  }
+                  val key = EditText(this).apply {
+                      hint = "Chave da API Anthropic (sk-ant-...)"
+                      setText(ChatStore.key(this@MainActivity))
+                      setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
+                      setSingleLine(true)
+                  }
+                  val saveKey = Button(this).apply {
+                      text = "Salvar chave"
+                      setOnClickListener {
+                          ChatStore.setKey(this@MainActivity, key.text.toString())
+                          Toast.makeText(this@MainActivity, "Chave salva", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  scroll = ScrollView(this).apply { addView(box) }
+                  val input = EditText(this).apply {
+                      hint = "Digite uma pergunta"
+                      setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
+                  }
+                  val send = Button(this).apply { text = "Enviar" }
+                  val clear = Button(this).apply {
+                      text = "Limpar"
+                      setOnClickListener { ChatStore.clear(this@MainActivity); refresh() }
+                  }
+                  send.setOnClickListener {
+                      val q = input.text.toString().trim()
+                      if (q.isEmpty()) return@setOnClickListener
+                      input.setText("")
+                      ChatStore.add(this, "user", q); refresh()
+                      Thread {
+                          val a = AiClient.ask(this, q)
+                          ChatStore.add(this, "assistant", a)
+                          runOnUiThread { refresh() }
+                      }.start()
+                  }
+                  val row = LinearLayout(this).apply {
+                      addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      addView(send); addView(clear)
+                  }
+                  root.addView(title)
+                  root.addView(toggle)
+                  root.addView(key)
+                  root.addView(saveKey)
+                  root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                  root.addView(row)
+                  setContentView(root)
+                  refresh()
+              }
+
+              private fun toggleService() {
+                  if (on) {
+                      stopService(Intent(this, WakeService::class.java))
+                      on = false
+                      toggle.text = "Ativar escuta (diga \"Luma\")"
+                      return
+                  }
+                  val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != 0) {
+                      requestPermissions(perms.toTypedArray(), 1)
+                      return
+                  }
+                  startForegroundService(Intent(this, WakeService::class.java))
+                  on = true
+                  toggle.text = "Escutando... (toque para parar)"
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == 0) toggleService()
+              }
+
+              private fun refresh() {
+                  box.removeAllViews()
+                  for (m in ChatStore.all(this)) {
+                      val tv = TextView(this).apply {
+                          text = (if (m.role == "user") "Voce: " else "Luma: ") + m.text
+                          textSize = 16f
+                          setTextColor(if (m.role == "user") Color.parseColor("#9ecbff") else Color.WHITE)
+                          setPadding(dp(8), dp(6), dp(8), dp(6))
+                          gravity = Gravity.START
+                      }
+                      box.addView(tv)
+                  }
+                  scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  val f = IntentFilter("luma.UPDATE")
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, f, Context.RECEIVER_NOT_EXPORTED)
+                  else registerReceiver(rx, f)
+                  refresh()
+              }
+
+              override fun onStop() { super.onStop(); unregisterReceiver(rx) }
+          }
+          LUMA_EOF
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Luma-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
